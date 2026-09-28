@@ -47,6 +47,8 @@ WEATHER_COLUMNS = ["date", "precip_mm"]
 # data.gov.in: "Current Daily Price of Various Commodities from Various Markets (Mandi)".
 DATAGOV_DAILY_RESOURCE = "9ef84268-d588-465a-a308-a864a43d0070"
 DATAGOV_BASE = "https://api.data.gov.in/resource"
+# Public sample key published on data.gov.in's API pages; capped at 10 records per request.
+DATAGOV_DEMO_KEY = "579b464db66ec23bdd000001cdd3946e44ce4aad7209ff7b23ac571b"
 OPEN_METEO_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
 
 # Agmarknet 2.0 public report API (what agmarknet.gov.in's own report page calls; no key).
@@ -248,21 +250,102 @@ class AgmarknetError(RuntimeError):
     pass
 
 
-def _agmarknet_post(http: requests.Session, path: str, payload: dict, timeout: float) -> dict:
-    last: Exception | None = None
+def _agmarknet_payload(style: str, fields: dict) -> dict:
+    """The report endpoint is undocumented; these are the request shapes we know of."""
+    if style == "native":
+        return {
+            **{k: fields[k] for k in ("from_date", "to_date")},
+            "data_type": AGMARKNET_PRICE,
+            "group": fields["group"],
+            "commodity": fields["commodity"],
+            "state": [fields["state"]],
+            "district": [AGMARKNET_ALL_DISTRICTS],
+            "market": [AGMARKNET_ALL_MARKETS],
+            "grade": [AGMARKNET_ALL_GRADES],
+            "variety": [AGMARKNET_ALL_VARIETIES],
+            "page": fields["page"],
+            "limit": fields["limit"],
+        }
+    # "bracketed" (used by other open-source clients), "query" and "form" share this encoding.
+    return {
+        **{k: fields[k] for k in ("from_date", "to_date")},
+        "data_type": str(AGMARKNET_PRICE),
+        "group": str(fields["group"]),
+        "commodity": str(fields["commodity"]),
+        "state": f"[{fields['state']}]",
+        "district": f"[{AGMARKNET_ALL_DISTRICTS}]",
+        "market": f"[{AGMARKNET_ALL_MARKETS}]",
+        "grade": f"[{AGMARKNET_ALL_GRADES}]",
+        "variety": f"[{AGMARKNET_ALL_VARIETIES}]",
+        "page": str(fields["page"]),
+        "limit": str(fields["limit"]),
+    }
+
+
+AGMARKNET_STYLES = ("bracketed", "native", "query", "form")
+REPORT_PATH = "/daily-price-arrival/report"
+
+
+def _agmarknet_request(
+    http: requests.Session, style: str, fields: dict, timeout: float
+) -> requests.Response:
+    url = f"{AGMARKNET_BASE}{REPORT_PATH}"
+    payload = _agmarknet_payload(style, fields)
+    if style == "query":
+        return http.get(url, params=payload, timeout=timeout)
+    if style == "form":
+        return http.post(url, data=payload, timeout=timeout)
+    return http.post(url, json=payload, timeout=timeout)
+
+
+def _agmarknet_call(http: requests.Session, style: str, fields: dict, timeout: float) -> dict:
+    """One report request, retrying server errors and rate limits but not client errors."""
+    last = ""
     for attempt in range(1, AGMARKNET_RETRIES + 1):
         try:
-            resp = http.post(f"{AGMARKNET_BASE}{path}", json=payload, timeout=timeout)
-            if resp.status_code == 429:
-                time.sleep(AGMARKNET_BACKOFF_S * 20 * attempt)
-                continue
-            resp.raise_for_status()
-            return resp.json()
-        except (requests.RequestException, ValueError) as exc:
-            last = exc
-            if attempt < AGMARKNET_RETRIES:
-                time.sleep(AGMARKNET_BACKOFF_S * 2**attempt)
-    raise AgmarknetError(f"POST {path} failed after {AGMARKNET_RETRIES} attempts: {last}")
+            resp = _agmarknet_request(http, style, fields, timeout)
+        except requests.RequestException as exc:
+            last = str(exc)
+        else:
+            if resp.ok:
+                try:
+                    return resp.json()
+                except ValueError:
+                    last = f"non-JSON response: {resp.text[:200]!r}"
+            elif 400 <= resp.status_code < 500 and resp.status_code != 429:
+                raise AgmarknetError(f"HTTP {resp.status_code}: {resp.text[:300]!r}")
+            else:
+                last = f"HTTP {resp.status_code}: {resp.text[:200]!r}"
+        if attempt < AGMARKNET_RETRIES:
+            time.sleep(AGMARKNET_BACKOFF_S * (20 if "429" in last else 1) * 2**attempt)
+    raise AgmarknetError(f"{REPORT_PATH} failed after {AGMARKNET_RETRIES} attempts: {last}")
+
+
+def _pick_agmarknet_style(http: requests.Session, fields: dict, timeout: float) -> str:
+    """Probe one recent week with each known request shape and keep the first that works."""
+    end = dt.date.today()
+    probe = {
+        **fields,
+        "from_date": (end - dt.timedelta(days=7)).isoformat(),
+        "to_date": end.isoformat(),
+        "page": 1,
+        "limit": 50,
+    }
+    errors = []
+    for style in AGMARKNET_STYLES:
+        try:
+            doc = _agmarknet_call(http, style, probe, timeout)
+        except AgmarknetError as exc:
+            errors.append(f"{style}: {exc}")
+            log.warning("Agmarknet request style %r rejected: %s", style, exc)
+            continue
+        log.info(
+            "Agmarknet request style %r accepted (%d groups)",
+            style,
+            len((doc.get("data") or {}).get("records") or []),
+        )
+        return style
+    raise AgmarknetError("no request style accepted; " + " | ".join(errors))
 
 
 def agmarknet_ids(filters: dict) -> tuple[int, int, int]:
@@ -316,10 +399,13 @@ def fetch_agmarknet(
     fetched in yearly chunks. A chunk that keeps failing is skipped with a warning.
     """
     http = session or requests.Session()
-    http.headers.update({"User-Agent": AGMARKNET_USER_AGENT, "Content-Type": "application/json"})
+    http.headers.update({"User-Agent": AGMARKNET_USER_AGENT, "Accept": "application/json"})
     resp = http.get(f"{AGMARKNET_BASE}/daily-price-arrival/filters", timeout=timeout)
     resp.raise_for_status()
     state_id, cmdt_id, group_id = agmarknet_ids(resp.json()["data"])
+
+    ids = {"state": state_id, "commodity": cmdt_id, "group": group_id}
+    style = _pick_agmarknet_style(http, ids, timeout)
 
     start = max(start, AGMARKNET_EARLIEST)
     rows: list[dict] = []
@@ -329,23 +415,14 @@ def fetch_agmarknet(
         page = 1
         try:
             while True:
-                payload = {
+                fields = {
+                    **ids,
                     "from_date": chunk_start.isoformat(),
                     "to_date": chunk_end.isoformat(),
-                    "data_type": str(AGMARKNET_PRICE),
-                    "group": str(group_id),
-                    "commodity": str(cmdt_id),
-                    "state": f"[{state_id}]",
-                    "district": f"[{AGMARKNET_ALL_DISTRICTS}]",
-                    "market": f"[{AGMARKNET_ALL_MARKETS}]",
-                    "grade": f"[{AGMARKNET_ALL_GRADES}]",
-                    "variety": f"[{AGMARKNET_ALL_VARIETIES}]",
-                    "page": str(page),
-                    "limit": str(page_size),
+                    "page": page,
+                    "limit": page_size,
                 }
-                batch = _agmarknet_rows(
-                    _agmarknet_post(http, "/daily-price-arrival/report", payload, timeout)
-                )
+                batch = _agmarknet_rows(_agmarknet_call(http, style, fields, timeout))
                 rows.extend(batch)
                 if len(batch) < page_size:
                     break

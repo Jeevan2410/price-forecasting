@@ -109,6 +109,8 @@ def test_merge_prices_newer_row_wins():
 
 class FakeResponse:
     status_code = 200
+    ok = True
+    text = ""
 
     def __init__(self, payload: dict):
         self._payload = payload
@@ -210,22 +212,47 @@ def _agm_record(district: str, market: str, day: str, modal: str) -> dict:
     }
 
 
+class ErrorResponse:
+    ok = False
+
+    def __init__(self, status: int, text: str):
+        self.status_code = status
+        self.text = text
+
+
 class FakeAgmarknet:
-    def __init__(self, reports: list[dict], fail_first_chunk: bool = False):
+    """Accepts only `accepted_style` requests; the first request per style is the probe."""
+
+    def __init__(self, reports: list[dict], accepted_style="bracketed", fail_from=None):
         self.headers: dict[str, str] = {}
         self.reports = reports
-        self.fail_first_chunk = fail_first_chunk
-        self.posts: list[dict] = []
+        self.accepted_style = accepted_style
+        self.fail_from = fail_from
+        self.calls: list[tuple[str, dict]] = []
 
-    def get(self, url, timeout=None):
-        assert url.endswith("/daily-price-arrival/filters")
-        return FakeResponse(AGMARKNET_FILTERS)
+    def get(self, url, params=None, timeout=None):
+        if url.endswith("/daily-price-arrival/filters"):
+            return FakeResponse(AGMARKNET_FILTERS)
+        return self._report("query", params)
 
-    def post(self, url, json=None, timeout=None):
-        self.posts.append(json)
-        if self.fail_first_chunk and json["from_date"] == self.posts[0]["from_date"]:
+    def post(self, url, json=None, data=None, timeout=None):
+        if data is not None:
+            return self._report("form", data)
+        style = "native" if isinstance(json["state"], list) else "bracketed"
+        return self._report(style, json)
+
+    def _report(self, style, payload):
+        self.calls.append((style, payload))
+        if style != self.accepted_style:
+            return ErrorResponse(400, '{"message":"Invalid payload"}')
+        if payload["limit"] in (50, "50"):  # probe
+            return FakeResponse({"data": {"records": []}})
+        if payload["from_date"] == self.fail_from:
             raise ingest.requests.ConnectionError("boom")
         return FakeResponse(self.reports.pop(0) if self.reports else {"data": {"records": []}})
+
+    def chunks(self):
+        return [p for _, p in self.calls if p["limit"] not in (50, "50")]
 
 
 def test_agmarknet_ids_match_state_and_commodity():
@@ -246,8 +273,8 @@ def test_fetch_agmarknet_chunks_by_year_and_keeps_only_dk(monkeypatch):
     out = ingest.fetch_agmarknet(dt.date(2020, 6, 1), dt.date(2023, 12, 31), session=session)
 
     # Clamped to 2021-01-01, then one request per <=365-day chunk: 2021, 2022, 2023.
-    assert [p["from_date"] for p in session.posts] == ["2021-01-01", "2022-01-01", "2023-01-01"]
-    first = session.posts[0]
+    assert [p["from_date"] for p in session.chunks()] == ["2021-01-01", "2022-01-01", "2023-01-01"]
+    first = session.chunks()[0]
     assert first["state"] == "[12]" and first["commodity"] == "140" and first["group"] == "9"
     assert session.headers["User-Agent"].startswith("AdikeCast")
     assert len(out) == 1
@@ -266,6 +293,27 @@ def test_fetch_agmarknet_skips_a_failing_chunk(monkeypatch):
             ]
         }
     }
-    session = FakeAgmarknet([report], fail_first_chunk=True)
+    session = FakeAgmarknet([report], fail_from="2021-01-01")
     out = ingest.fetch_agmarknet(dt.date(2021, 1, 1), dt.date(2022, 6, 30), session=session)
     assert list(out["market"]) == ["Puttur"]
+
+
+def test_fetch_agmarknet_falls_back_to_a_request_shape_the_server_accepts(monkeypatch):
+    monkeypatch.setattr(ingest.time, "sleep", lambda s: None)
+    record = _agm_record("Dakshina Kannada", "Sullia", "10-03-2024", "31000")
+    session = FakeAgmarknet([{"data": {"records": [{"data": [record]}]}}], accepted_style="native")
+
+    out = ingest.fetch_agmarknet(dt.date(2024, 1, 1), dt.date(2024, 6, 30), session=session)
+
+    styles = [style for style, _ in session.calls]
+    assert styles[:2] == ["bracketed", "native"]  # probe rejected once, then accepted
+    chunk = session.chunks()[0]
+    assert chunk["state"] == [12] and chunk["commodity"] == 140
+    assert list(out["market"]) == ["Sullia"]
+
+
+def test_fetch_agmarknet_reports_every_rejection(monkeypatch):
+    monkeypatch.setattr(ingest.time, "sleep", lambda s: None)
+    session = FakeAgmarknet([], accepted_style="none")
+    with pytest.raises(ingest.AgmarknetError, match="Invalid payload"):
+        ingest.fetch_agmarknet(dt.date(2024, 1, 1), dt.date(2024, 2, 1), session=session)

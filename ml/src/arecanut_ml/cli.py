@@ -36,6 +36,9 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def _save_prices(new: pd.DataFrame, label: str) -> None:
+    if new.empty:
+        log.warning("%s: no Dakshina Kannada rows returned; nothing saved", label)
+        return
     existing = ingest.read_prices_csv(RAW_PRICES_CSV)
     merged = ingest.merge_prices(existing, new)
     ingest.write_prices_csv(merged, RAW_PRICES_CSV)
@@ -51,11 +54,22 @@ def cmd_fetch_prices(args: argparse.Namespace) -> int:
     today = dt.date.today()
     first_fetch = ingest.read_prices_csv(RAW_PRICES_CSV) is None
     start = ingest.AGMARKNET_EARLIEST if first_fetch else today - dt.timedelta(days=21)
-    _save_prices(ingest.fetch_agmarknet(start, today), f"agmarknet {start}..{today}")
+    try:
+        _save_prices(ingest.fetch_agmarknet(start, today), f"agmarknet {start}..{today}")
+    except Exception as exc:
+        log.error("Agmarknet fetch failed: %s", exc)
 
+    # data.gov.in's daily feed as a second source. Without a personal key, the portal's public
+    # demo key still works (10 rows per request), which is plenty for one district.
     key = os.environ.get("DATA_GOV_IN_API_KEY")
-    if key:
-        _save_prices(ingest.fetch_datagov(key), "data.gov.in")
+    try:
+        if key:
+            new = ingest.fetch_datagov(key)
+        else:
+            new = ingest.fetch_datagov(ingest.DATAGOV_DEMO_KEY, page_size=10, max_pages=60)
+        _save_prices(new, "data.gov.in")
+    except Exception as exc:  # the second source must never block the first
+        log.error("data.gov.in fetch failed: %s", exc)
     return 0
 
 
