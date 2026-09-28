@@ -1,0 +1,88 @@
+name: Refresh data and forecasts
+
+# Agmarknet publishes the day's arrivals in the evening; run at 19:30 IST (14:00 UTC).
+on:
+  schedule:
+    - cron: "0 14 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "auto = real data once 2 years are ingested, else synthetic"
+        type: choice
+        options: [auto, synthetic, real]
+        default: auto
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-data
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DATA_GOV_IN_API_KEY: ${{ secrets.DATA_GOV_IN_API_KEY }}
+      VERCEL_DEPLOY_HOOK_URL: ${{ secrets.VERCEL_DEPLOY_HOOK_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decide whether to run
+        id: gate
+        run: |
+          # Without an API key the site shows synthetic demo data; refreshing it weekly is enough.
+          if [ -z "$DATA_GOV_IN_API_KEY" ] && [ "${{ github.event_name }}" = "schedule" ] && [ "$(date -u +%u)" != "1" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.run == 'true'
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: ml/pyproject.toml
+
+      - name: Fetch prices + rainfall, retrain, backtest, export
+        if: steps.gate.outputs.run == 'true'
+        working-directory: ml
+        run: |
+          pip install -e .
+          python -m arecanut_ml -v refresh --mode "${{ inputs.mode || 'auto' }}"
+
+      - uses: actions/setup-node@v4
+        if: steps.gate.outputs.run == 'true'
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Validate the export against the web app's schema
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          npm ci
+          npm test
+
+      - name: Commit and push
+        if: steps.gate.outputs.run == 'true'
+        id: commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/data/dashboard.json data/raw
+          if git diff --cached --quiet; then
+            echo "No changes."
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "data: refresh forecasts $(date -u +%Y-%m-%d)"
+            git push
+            echo "pushed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Optional: Vercel deploys pushes automatically, but bot-authored commits can be skipped on
+      # some plans. A deploy hook (Project Settings -> Git -> Deploy Hooks) always deploys.
+      - name: Trigger Vercel deploy hook
+        if: steps.commit.outputs.pushed == 'true' && env.VERCEL_DEPLOY_HOOK_URL != ''
+        run: curl -fsS -X POST "$VERCEL_DEPLOY_HOOK_URL" > /dev/null
