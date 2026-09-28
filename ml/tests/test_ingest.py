@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import datetime as dt
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -106,6 +108,8 @@ def test_merge_prices_newer_row_wins():
 
 
 class FakeResponse:
+    status_code = 200
+
     def __init__(self, payload: dict):
         self._payload = payload
 
@@ -175,3 +179,93 @@ def test_csv_round_trip(tmp_path, small_prices):
     pd.testing.assert_frame_equal(
         back.reset_index(drop=True), small_prices.reset_index(drop=True), check_dtype=False
     )
+
+
+AGMARKNET_FILTERS = {
+    "data": {
+        "state_data": [
+            {"state_id": 11, "state_name": "Kerala"},
+            {"state_id": 12, "state_name": "Karnataka"},
+        ],
+        "cmdt_data": [
+            {"cmdt_id": 7, "cmdt_group_id": 3, "cmdt_name": "Coconut"},
+            {"cmdt_id": 140, "cmdt_group_id": 9, "cmdt_name": "Arecanut(Betelnut/Supari)"},
+        ],
+    }
+}
+
+
+def _agm_record(district: str, market: str, day: str, modal: str) -> dict:
+    return {
+        "state_name": "Karnataka",
+        "district_name": district,
+        "market_name": market,
+        "cmdt_name": "Arecanut(Betelnut/Supari)",
+        "variety_name": "New Variety",
+        "grade_name": "FAQ",
+        "arrival_date": day,
+        "min_price": "30,000",
+        "max_price": "36000",
+        "model_price": modal,
+    }
+
+
+class FakeAgmarknet:
+    def __init__(self, reports: list[dict], fail_first_chunk: bool = False):
+        self.headers: dict[str, str] = {}
+        self.reports = reports
+        self.fail_first_chunk = fail_first_chunk
+        self.posts: list[dict] = []
+
+    def get(self, url, timeout=None):
+        assert url.endswith("/daily-price-arrival/filters")
+        return FakeResponse(AGMARKNET_FILTERS)
+
+    def post(self, url, json=None, timeout=None):
+        self.posts.append(json)
+        if self.fail_first_chunk and json["from_date"] == self.posts[0]["from_date"]:
+            raise ingest.requests.ConnectionError("boom")
+        return FakeResponse(self.reports.pop(0) if self.reports else {"data": {"records": []}})
+
+
+def test_agmarknet_ids_match_state_and_commodity():
+    assert ingest.agmarknet_ids(AGMARKNET_FILTERS["data"]) == (12, 140, 9)
+
+
+def test_fetch_agmarknet_chunks_by_year_and_keeps_only_dk(monkeypatch):
+    monkeypatch.setattr(ingest.time, "sleep", lambda s: None)
+    report = {
+        "data": {
+            "records": [
+                {"data": [_agm_record("Dakshina Kannada", "Bantwal", "05-09-2023", "34,500")]},
+                {"data": [_agm_record("Shimoga", "Shimoga", "05-09-2023", "48000")]},
+            ]
+        }
+    }
+    session = FakeAgmarknet([report])
+    out = ingest.fetch_agmarknet(dt.date(2020, 6, 1), dt.date(2023, 12, 31), session=session)
+
+    # Clamped to 2021-01-01, then one request per <=365-day chunk: 2021, 2022, 2023.
+    assert [p["from_date"] for p in session.posts] == ["2021-01-01", "2022-01-01", "2023-01-01"]
+    first = session.posts[0]
+    assert first["state"] == "[12]" and first["commodity"] == "140" and first["group"] == "9"
+    assert session.headers["User-Agent"].startswith("AdikeCast")
+    assert len(out) == 1
+    row = out.iloc[0]
+    assert row["market"] == "Bantwala"
+    assert row["modal_price"] == 34_500
+    assert row["date"] == pd.Timestamp("2023-09-05")
+
+
+def test_fetch_agmarknet_skips_a_failing_chunk(monkeypatch):
+    monkeypatch.setattr(ingest.time, "sleep", lambda s: None)
+    report = {
+        "data": {
+            "records": [
+                {"data": [_agm_record("Dakshina Kannada", "Puttur", "02-01-2022", "33000")]}
+            ]
+        }
+    }
+    session = FakeAgmarknet([report], fail_first_chunk=True)
+    out = ingest.fetch_agmarknet(dt.date(2021, 1, 1), dt.date(2022, 6, 30), session=session)
+    assert list(out["market"]) == ["Puttur"]

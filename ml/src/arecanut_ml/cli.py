@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import logging
 import os
 import sys
@@ -34,17 +35,34 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_fetch_prices(args: argparse.Namespace) -> int:
-    key = os.environ.get("DATA_GOV_IN_API_KEY")
-    if not key:
-        log.warning("DATA_GOV_IN_API_KEY is not set; skipping price fetch")
-        return 0
-    new = ingest.fetch_datagov(key)
+def _save_prices(new: pd.DataFrame, label: str) -> None:
     existing = ingest.read_prices_csv(RAW_PRICES_CSV)
     merged = ingest.merge_prices(existing, new)
     ingest.write_prices_csv(merged, RAW_PRICES_CSV)
     before = 0 if existing is None else len(existing)
-    print(f"prices: {len(new)} fetched, {len(merged) - before} new rows, {len(merged)} total")
+    print(f"{label}: {len(new)} DK rows fetched, {len(merged) - before} new, {len(merged)} total")
+
+
+def cmd_fetch_prices(args: argparse.Namespace) -> int:
+    """Recent prices: Agmarknet report API (no key), plus data.gov.in when a key is set.
+
+    Re-reading the last few weeks catches late uploads and corrections.
+    """
+    today = dt.date.today()
+    first_fetch = ingest.read_prices_csv(RAW_PRICES_CSV) is None
+    start = ingest.AGMARKNET_EARLIEST if first_fetch else today - dt.timedelta(days=21)
+    _save_prices(ingest.fetch_agmarknet(start, today), f"agmarknet {start}..{today}")
+
+    key = os.environ.get("DATA_GOV_IN_API_KEY")
+    if key:
+        _save_prices(ingest.fetch_datagov(key), "data.gov.in")
+    return 0
+
+
+def cmd_backfill(args: argparse.Namespace) -> int:
+    """Full history from the Agmarknet report API (prices start 2021-01-01)."""
+    start = dt.date.fromisoformat(args.start)
+    _save_prices(ingest.fetch_agmarknet(start, dt.date.today()), f"agmarknet backfill {start}..")
     return 0
 
 
@@ -95,8 +113,14 @@ def build_parser() -> argparse.ArgumentParser:
     add_run_args(p_run)
     p_run.set_defaults(func=cmd_run)
 
-    p_prices = sub.add_parser("fetch-prices", help="append today's prices from data.gov.in")
+    p_prices = sub.add_parser(
+        "fetch-prices", help="append recent prices (Agmarknet API; data.gov.in if keyed)"
+    )
     p_prices.set_defaults(func=cmd_fetch_prices)
+
+    p_backfill = sub.add_parser("backfill", help="download full history from Agmarknet")
+    p_backfill.add_argument("--start", default="2021-01-01", help="YYYY-MM-DD")
+    p_backfill.set_defaults(func=cmd_backfill)
 
     p_weather = sub.add_parser("fetch-weather", help="update Mangaluru rainfall (Open-Meteo)")
     p_weather.add_argument("--start", default="2016-01-01")

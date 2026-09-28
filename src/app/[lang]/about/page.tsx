@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 
 import { Section } from "@/components/ui";
-import { dashboard, isDemo } from "@/lib/data";
+import { allSeries, dashboard, isDemo } from "@/lib/data";
 import { getDictionary, isLocale, type Locale } from "@/lib/i18n";
 import { DEFAULT_PARAMS } from "@/lib/signal";
 
@@ -90,15 +90,17 @@ function content(lang: Locale): Block[] {
   ];
 }
 
-const API = [
-  { path: "/api/v1/series", desc: "Every market × variety with its latest price, weekly change and default signal." },
-  { path: "/api/v1/series/mangalore--new-variety", desc: "Full weekly history, 12-week forecast (P10/P50/P90) and seasonality for one series." },
-  {
-    path: "/api/v1/signal/mangalore--new-variety?storageLoss=0.5&interest=12&quantity=20",
-    desc: "Sell/hold signal with your own holding costs, plus the revenue plan for a quantity in quintals.",
-  },
-  { path: "/api/v1/alert/mangalore--new-variety?lang=kn", desc: "Ready-to-send WhatsApp text (en or kn), for bots and group admins." },
-];
+function apiExamples(id: string) {
+  return [
+    { path: "/api/v1/series", desc: "Every market × variety with its latest price, weekly change and default signal." },
+    { path: `/api/v1/series/${id}`, desc: "Full weekly history, 12-week forecast (P10/P50/P90) and seasonality for one series." },
+    {
+      path: `/api/v1/signal/${id}?storageLoss=0.5&interest=12&quantity=20`,
+      desc: "Sell/hold signal with your own holding costs, plus the revenue plan for a quantity in quintals.",
+    },
+    { path: `/api/v1/alert/${id}?lang=kn`, desc: "Ready-to-send WhatsApp text (en or kn), for bots and group admins." },
+  ];
+}
 
 export default async function AboutPage({ params }: PageProps<"/[lang]/about">) {
   const { lang } = await params;
@@ -125,7 +127,7 @@ export default async function AboutPage({ params }: PageProps<"/[lang]/about">) 
       </div>
       <Section title="JSON API" subtitle={`Free, read-only, CORS-enabled. Model: ${dashboard.meta.model}.`}>
         <ul className="grid gap-4">
-          {API.map((a) => (
+          {apiExamples(allSeries()[0].id).map((a) => (
             <li key={a.path}>
               <a href={a.path} className="break-all font-mono text-sm text-accent underline">
                 GET {a.path}

@@ -9,8 +9,10 @@ Prices are in Rs per quintal. ``arrivals_tonnes`` is NaN when the source has no 
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import re
+import time
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -46,6 +48,19 @@ WEATHER_COLUMNS = ["date", "precip_mm"]
 DATAGOV_DAILY_RESOURCE = "9ef84268-d588-465a-a308-a864a43d0070"
 DATAGOV_BASE = "https://api.data.gov.in/resource"
 OPEN_METEO_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
+
+# Agmarknet 2.0 public report API (what agmarknet.gov.in's own report page calls; no key).
+AGMARKNET_BASE = "https://api.agmarknet.gov.in/v1"
+AGMARKNET_EARLIEST = dt.date(2021, 1, 1)
+AGMARKNET_USER_AGENT = "AdikeCast (github.com/Jeevan2410/price-forecasting)"
+AGMARKNET_RETRIES = 3
+AGMARKNET_BACKOFF_S = 1.5
+# The report form's "All ..." option ids.
+AGMARKNET_ALL_DISTRICTS = 100001
+AGMARKNET_ALL_MARKETS = 100002
+AGMARKNET_ALL_GRADES = 100003
+AGMARKNET_PRICE = 100004
+AGMARKNET_ALL_VARIETIES = 100007
 
 # Column names seen across data.gov.in JSON, Agmarknet report exports and CEDA downloads,
 # after lower-casing and stripping everything except letters and digits.
@@ -227,6 +242,124 @@ def fetch_datagov(
     if "district" not in df.columns:
         df["district"] = DISTRICT
     return normalize_prices(df)
+
+
+class AgmarknetError(RuntimeError):
+    pass
+
+
+def _agmarknet_post(http: requests.Session, path: str, payload: dict, timeout: float) -> dict:
+    last: Exception | None = None
+    for attempt in range(1, AGMARKNET_RETRIES + 1):
+        try:
+            resp = http.post(f"{AGMARKNET_BASE}{path}", json=payload, timeout=timeout)
+            if resp.status_code == 429:
+                time.sleep(AGMARKNET_BACKOFF_S * 20 * attempt)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            last = exc
+            if attempt < AGMARKNET_RETRIES:
+                time.sleep(AGMARKNET_BACKOFF_S * 2**attempt)
+    raise AgmarknetError(f"POST {path} failed after {AGMARKNET_RETRIES} attempts: {last}")
+
+
+def agmarknet_ids(filters: dict) -> tuple[int, int, int]:
+    """Return (state_id, commodity_id, commodity_group_id) for Karnataka arecanut."""
+    state_id = next(
+        (int(s["state_id"]) for s in filters["state_data"] if _key(s["state_name"]) == _key(STATE)),
+        None,
+    )
+    cmdt = next(
+        (c for c in filters["cmdt_data"] if _key(c["cmdt_name"]) == _key(COMMODITY)),
+        None,
+    ) or next((c for c in filters["cmdt_data"] if "arecanut" in _key(c["cmdt_name"])), None)
+    if state_id is None or cmdt is None:
+        raise AgmarknetError("Karnataka or arecanut not found in Agmarknet filter lists")
+    return state_id, int(cmdt["cmdt_id"]), int(cmdt["cmdt_group_id"])
+
+
+def _agmarknet_rows(doc: dict) -> list[dict]:
+    """Report records come grouped; flatten them into the OGD-like row shape."""
+    groups = (doc.get("data") or {}).get("records") or []
+    rows = [r for g in groups for r in (g.get("data") or [])]
+    return [
+        {
+            "state": r.get("state_name"),
+            "district": r.get("district_name"),
+            "market": r.get("market_name"),
+            "commodity": r.get("cmdt_name"),
+            "variety": r.get("variety_name"),
+            "arrival_date": str(r.get("arrival_date", "")).strip(),  # DD-MM-YYYY
+            "min_price": r.get("min_price"),
+            "max_price": r.get("max_price"),
+            # The API spells the modal price "model_price".
+            "modal_price": r.get("model_price", r.get("modal_price")),
+        }
+        for r in rows
+    ]
+
+
+def fetch_agmarknet(
+    start: dt.date,
+    end: dt.date,
+    *,
+    session: requests.Session | None = None,
+    timeout: float = 120.0,
+    page_size: int = 1000,
+) -> pd.DataFrame:
+    """Karnataka arecanut prices from the public Agmarknet 2.0 report API (no key needed).
+
+    This is the endpoint behind agmarknet.gov.in's "Daily Price and Arrival Report" page. Price
+    history starts 2021-01-01 and one request may span at most a year, so longer ranges are
+    fetched in yearly chunks. A chunk that keeps failing is skipped with a warning.
+    """
+    http = session or requests.Session()
+    http.headers.update({"User-Agent": AGMARKNET_USER_AGENT, "Content-Type": "application/json"})
+    resp = http.get(f"{AGMARKNET_BASE}/daily-price-arrival/filters", timeout=timeout)
+    resp.raise_for_status()
+    state_id, cmdt_id, group_id = agmarknet_ids(resp.json()["data"])
+
+    start = max(start, AGMARKNET_EARLIEST)
+    rows: list[dict] = []
+    chunk_start = start
+    while chunk_start <= end:
+        chunk_end = min(chunk_start + dt.timedelta(days=364), end)
+        page = 1
+        try:
+            while True:
+                payload = {
+                    "from_date": chunk_start.isoformat(),
+                    "to_date": chunk_end.isoformat(),
+                    "data_type": str(AGMARKNET_PRICE),
+                    "group": str(group_id),
+                    "commodity": str(cmdt_id),
+                    "state": f"[{state_id}]",
+                    "district": f"[{AGMARKNET_ALL_DISTRICTS}]",
+                    "market": f"[{AGMARKNET_ALL_MARKETS}]",
+                    "grade": f"[{AGMARKNET_ALL_GRADES}]",
+                    "variety": f"[{AGMARKNET_ALL_VARIETIES}]",
+                    "page": str(page),
+                    "limit": str(page_size),
+                }
+                batch = _agmarknet_rows(
+                    _agmarknet_post(http, "/daily-price-arrival/report", payload, timeout)
+                )
+                rows.extend(batch)
+                if len(batch) < page_size:
+                    break
+                page += 1
+                time.sleep(AGMARKNET_BACKOFF_S)
+        except AgmarknetError as exc:
+            log.warning("skipped Agmarknet %s..%s: %s", chunk_start, chunk_end, exc)
+        log.info("Agmarknet %s..%s: %d Karnataka rows so far", chunk_start, chunk_end, len(rows))
+        chunk_start = chunk_end + dt.timedelta(days=1)
+        time.sleep(AGMARKNET_BACKOFF_S)
+
+    if not rows:
+        return pd.DataFrame(columns=PRICE_COLUMNS)
+    return normalize_prices(pd.DataFrame(rows))
 
 
 def normalize_weather(raw: pd.DataFrame) -> pd.DataFrame:

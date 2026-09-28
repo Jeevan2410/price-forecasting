@@ -4,9 +4,9 @@ Weekly arecanut (*adike*) price forecasts for the Dakshina Kannada mandis (Manga
 Sullia, Belthangady), turned into a plain **Sell now / Hold / Sell part** signal for farmers. Available
 in English and Kannada, with a sell calculator, WhatsApp sharing and a free JSON API for traders and co-ops.
 
-> **Status: demo data.** The site currently runs on a *synthetic* price series calibrated to published
-> ranges (see [Data](#data)). Every page shows a banner saying so. Add a data.gov.in API key and backfill
-> history to switch to real Agmarknet prices, and the banner disappears automatically.
+> The site starts on a *synthetic* demo series and switches to real Agmarknet prices automatically
+> once the backfill has at least two years of history (see [Data](#data)). While it is on demo data,
+> every page shows a banner saying so.
 
 The plan and design rationale are in [`docs/PLAN.md`](docs/PLAN.md).
 
@@ -23,7 +23,7 @@ The plan and design rationale are in [`docs/PLAN.md`](docs/PLAN.md).
 | `.github/workflows/` | CI, plus the daily data refresh (19:30 IST) that commits new forecasts |
 
 ```
-data.gov.in / Agmarknet CSV / Open-Meteo
+Agmarknet report API / data.gov.in / CSV / Open-Meteo
         │  (GitHub Actions, daily)
         ▼
 ml/: weekly median price → features → gradient boosting (P10/P50/P90)
@@ -59,18 +59,21 @@ cd ml && ruff check . && pytest       # ingest parsing, no look-ahead leakage, m
 
 ## Data
 
-**Going live with real prices:**
+**Real prices come from Agmarknet's public report API**, the same endpoint that
+agmarknet.gov.in's "Daily Price and Arrival Report" page uses. It needs **no key** and has daily prices
+from 2021-01-01. The daily workflow uses it automatically:
 
-1. Get a free API key at [data.gov.in](https://data.gov.in) (sign up, then "My Account → Generate Key").
-2. Add it as a repository secret named `DATA_GOV_IN_API_KEY` (Settings → Secrets and variables → Actions).
-3. **Backfill history.** The daily API only returns *today's* prices, and the model needs about 2 years. Download
-   the Arecanut → Karnataka → Dakshina Kannada price report from [Agmarknet](https://agmarknet.gov.in)
-   or [CEDA](https://agmarknet.ceda.ashoka.edu.in/) as CSV/Excel, then:
-   ```bash
-   cd ml && python -m arecanut_ml import-csv ~/Downloads/arecanut_dk_*.csv
-   git add data/raw && git commit -m "data: backfill Agmarknet history" && git push
-   ```
-4. Run the **Refresh data and forecasts** workflow once (Actions tab → Run workflow). After that it runs daily.
+- **First run:** no `data/raw/agmarknet_arecanut_dk.csv` yet, so it backfills all Karnataka arecanut
+  rows since 2021, keeps Dakshina Kannada, and commits the CSV.
+- **Later runs:** re-read the last 3 weeks, which catches late uploads.
+
+Run it by hand with `cd ml && python -m arecanut_ml backfill`, or trigger **Refresh data and forecasts**
+from the Actions tab.
+
+Optional extras:
+- `DATA_GOV_IN_API_KEY` repository secret: also merges today's rows from the data.gov.in daily feed.
+- `python -m arecanut_ml import-csv <files>`: merges Agmarknet or CEDA CSV/Excel exports, for example
+  history before 2021.
 
 The pipeline switches from synthetic to real data by itself once any market has at least
 104 weeks of history (`--mode real` forces it).
@@ -116,10 +119,10 @@ and `VERCEL_DEPLOY_HOOK_URL` as a GitHub secret if bot commits ever stop trigger
 
 ## Before a public launch
 
-- [ ] Connect real data (steps above) and re-read the accuracy page on real prices.
+- [ ] Re-read the accuracy page once it is computed on real prices.
 - [ ] Have a native Kannada speaker from DK review `src/lib/i18n.ts` and the About page.
-- [ ] Check the data.gov.in resource and filter names against a live response (`fetch-prices` is
-      covered by fixture tests only; the build sandbox could not reach the API).
+- [ ] The Agmarknet API is undocumented; if it changes shape, `fetch_agmarknet` in
+      `ml/src/arecanut_ml/ingest.py` is the one place to update.
 
 ## Roadmap
 
