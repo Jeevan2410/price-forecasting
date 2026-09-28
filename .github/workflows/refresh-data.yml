@@ -35,8 +35,8 @@ jobs:
           cache: pip
           cache-dependency-path: ml/pyproject.toml
 
-      # The first run (no data/raw CSV yet) backfills Agmarknet history from 2021; later runs
-      # re-read the last three weeks. DATA_GOV_IN_API_KEY is optional.
+      # Appends today's data.gov.in rows (DATA_GOV_IN_API_KEY optional; the demo key is the
+      # fallback). History is imported once by hand: see README "Getting real prices".
       - name: Fetch prices + rainfall, retrain, backtest, export
         working-directory: ml
         run: |

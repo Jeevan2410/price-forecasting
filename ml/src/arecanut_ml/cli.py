@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import logging
 import os
 import sys
@@ -47,36 +46,17 @@ def _save_prices(new: pd.DataFrame, label: str) -> None:
 
 
 def cmd_fetch_prices(args: argparse.Namespace) -> int:
-    """Recent prices: Agmarknet report API (no key), plus data.gov.in when a key is set.
+    """Today's Dakshina Kannada rows from data.gov.in's daily Agmarknet feed.
 
-    Re-reading the last few weeks catches late uploads and corrections.
+    The feed only holds the current day, so history comes from `import-csv`. Without a personal
+    key the portal's published demo key still works (10 rows per request).
     """
-    today = dt.date.today()
-    first_fetch = ingest.read_prices_csv(RAW_PRICES_CSV) is None
-    start = ingest.AGMARKNET_EARLIEST if first_fetch else today - dt.timedelta(days=21)
-    try:
-        _save_prices(ingest.fetch_agmarknet(start, today), f"agmarknet {start}..{today}")
-    except Exception as exc:
-        log.error("Agmarknet fetch failed: %s", exc)
-
-    # data.gov.in's daily feed as a second source. Without a personal key, the portal's public
-    # demo key still works (10 rows per request), which is plenty for one district.
     key = os.environ.get("DATA_GOV_IN_API_KEY")
-    try:
-        if key:
-            new = ingest.fetch_datagov(key)
-        else:
-            new = ingest.fetch_datagov(ingest.DATAGOV_DEMO_KEY, page_size=10, max_pages=60)
-        _save_prices(new, "data.gov.in")
-    except Exception as exc:  # the second source must never block the first
-        log.error("data.gov.in fetch failed: %s", exc)
-    return 0
-
-
-def cmd_backfill(args: argparse.Namespace) -> int:
-    """Full history from the Agmarknet report API (prices start 2021-01-01)."""
-    start = dt.date.fromisoformat(args.start)
-    _save_prices(ingest.fetch_agmarknet(start, dt.date.today()), f"agmarknet backfill {start}..")
+    if key:
+        new = ingest.fetch_datagov(key)
+    else:
+        new = ingest.fetch_datagov(ingest.DATAGOV_DEMO_KEY, page_size=10, max_pages=60)
+    _save_prices(new, "data.gov.in")
     return 0
 
 
@@ -127,14 +107,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_run_args(p_run)
     p_run.set_defaults(func=cmd_run)
 
-    p_prices = sub.add_parser(
-        "fetch-prices", help="append recent prices (Agmarknet API; data.gov.in if keyed)"
-    )
+    p_prices = sub.add_parser("fetch-prices", help="append today's prices from data.gov.in")
     p_prices.set_defaults(func=cmd_fetch_prices)
-
-    p_backfill = sub.add_parser("backfill", help="download full history from Agmarknet")
-    p_backfill.add_argument("--start", default="2021-01-01", help="YYYY-MM-DD")
-    p_backfill.set_defaults(func=cmd_backfill)
 
     p_weather = sub.add_parser("fetch-weather", help="update Mangaluru rainfall (Open-Meteo)")
     p_weather.add_argument("--start", default="2016-01-01")

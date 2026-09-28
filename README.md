@@ -4,9 +4,9 @@ Weekly arecanut (*adike*) price forecasts for the Dakshina Kannada mandis (Manga
 Sullia, Belthangady), turned into a plain **Sell now / Hold / Sell part** signal for farmers. Available
 in English and Kannada, with a sell calculator, WhatsApp sharing and a free JSON API for traders and co-ops.
 
-> The site starts on a *synthetic* demo series and switches to real Agmarknet prices automatically
-> once the backfill has at least two years of history (see [Data](#data)). While it is on demo data,
-> every page shows a banner saying so.
+> The site starts on a *synthetic* demo series. It switches to real Agmarknet prices automatically
+> once two years of history have been imported (see [Data](#data)). While it is on demo data, every
+> page shows a banner saying so.
 
 The plan and design rationale are in [`docs/PLAN.md`](docs/PLAN.md).
 
@@ -23,7 +23,7 @@ The plan and design rationale are in [`docs/PLAN.md`](docs/PLAN.md).
 | `.github/workflows/` | CI, plus the daily data refresh (19:30 IST) that commits new forecasts |
 
 ```
-Agmarknet report API / data.gov.in / CSV / Open-Meteo
+Agmarknet CSV export / data.gov.in daily feed / Open-Meteo
         │  (GitHub Actions, daily)
         ▼
 ml/: weekly median price → features → gradient boosting (P10/P50/P90)
@@ -59,21 +59,27 @@ cd ml && ruff check . && pytest       # ingest parsing, no look-ahead leakage, m
 
 ## Data
 
-**Real prices come from Agmarknet's public report API**, the same endpoint that
-agmarknet.gov.in's "Daily Price and Arrival Report" page uses. It needs **no key** and has daily prices
-from 2021-01-01. The daily workflow uses it automatically:
+**Getting real prices.** There are two parts:
 
-- **First run:** no `data/raw/agmarknet_arecanut_dk.csv` yet, so it backfills all Karnataka arecanut
-  rows since 2021, keeps Dakshina Kannada, and commits the CSV.
-- **Later runs:** re-read the last 3 weeks, which catches late uploads.
+1. **History (one time, by hand).** The model needs about two years of prices. Agmarknet's
+   report API requires a CAPTCHA, so this can't be automated. Download the history on the website instead:
+   - [agmarknet.gov.in](https://agmarknet.gov.in) → *Daily Price and Arrival Report* → Commodity
+     *Arecanut(Betelnut/Supari)*, State *Karnataka*, District *Dakshina Kannada*, a date range, then
+     export. Repeat per year if one export is capped.
+   - or [CEDA Agri Market Data](https://agmarknet.ceda.ashoka.edu.in/) → Arecanut → Karnataka →
+     Dakshina Kannada → download CSV (a free login may be required).
 
-Run it by hand with `cd ml && python -m arecanut_ml backfill`, or trigger **Refresh data and forecasts**
-from the Actions tab.
+   Then import and commit:
+   ```bash
+   cd ml && python -m arecanut_ml import-csv ~/Downloads/*.csv ~/Downloads/*.xlsx
+   git add data/raw && git commit -m "data: import Agmarknet history" && git push
+   ```
+   The column names of both exports are recognised, and non-DK or non-arecanut rows are dropped.
 
-Optional extras:
-- `DATA_GOV_IN_API_KEY` repository secret: also merges today's rows from the data.gov.in daily feed.
-- `python -m arecanut_ml import-csv <files>`: merges Agmarknet or CEDA CSV/Excel exports, for example
-  history before 2021.
+2. **Daily updates (automatic).** The refresh workflow appends each day's rows from data.gov.in's
+   Agmarknet feed. It works without registering, using the portal's published demo key (10 rows per
+   request). A personal key (`DATA_GOV_IN_API_KEY` secret, free at data.gov.in → My Account)
+   is faster and more reliable.
 
 The pipeline switches from synthetic to real data by itself once any market has at least
 104 weeks of history (`--mode real` forces it).
@@ -121,8 +127,8 @@ and `VERCEL_DEPLOY_HOOK_URL` as a GitHub secret if bot commits ever stop trigger
 
 - [ ] Re-read the accuracy page once it is computed on real prices.
 - [ ] Have a native Kannada speaker from DK review `src/lib/i18n.ts` and the About page.
-- [ ] The Agmarknet API is undocumented; if it changes shape, `fetch_agmarknet` in
-      `ml/src/arecanut_ml/ingest.py` is the one place to update.
+- [ ] Confirm the data.gov.in feed returns Dakshina Kannada arecanut rows (check the refresh
+      workflow log for "data.gov.in: N DK rows fetched").
 
 ## Roadmap
 

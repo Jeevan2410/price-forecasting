@@ -9,10 +9,8 @@ Prices are in Rs per quintal. ``arrivals_tonnes`` is NaN when the source has no 
 
 from __future__ import annotations
 
-import datetime as dt
 import logging
 import re
-import time
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -51,18 +49,6 @@ DATAGOV_BASE = "https://api.data.gov.in/resource"
 DATAGOV_DEMO_KEY = "579b464db66ec23bdd000001cdd3946e44ce4aad7209ff7b23ac571b"
 OPEN_METEO_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
 
-# Agmarknet 2.0 public report API (what agmarknet.gov.in's own report page calls; no key).
-AGMARKNET_BASE = "https://api.agmarknet.gov.in/v1"
-AGMARKNET_EARLIEST = dt.date(2021, 1, 1)
-AGMARKNET_USER_AGENT = "AdikeCast (github.com/Jeevan2410/price-forecasting)"
-AGMARKNET_RETRIES = 3
-AGMARKNET_BACKOFF_S = 1.5
-# The report form's "All ..." option ids.
-AGMARKNET_ALL_DISTRICTS = 100001
-AGMARKNET_ALL_MARKETS = 100002
-AGMARKNET_ALL_GRADES = 100003
-AGMARKNET_PRICE = 100004
-AGMARKNET_ALL_VARIETIES = 100007
 
 # Column names seen across data.gov.in JSON, Agmarknet report exports and CEDA downloads,
 # after lower-casing and stripping everything except letters and digits.
@@ -210,7 +196,7 @@ def fetch_datagov(
     page_size: int = 500,
     max_pages: int = 40,
     session: requests.Session | None = None,
-    timeout: float = 30.0,
+    timeout: float = 120.0,
 ) -> pd.DataFrame:
     """Fetch Karnataka arecanut rows from a data.gov.in Agmarknet resource.
 
@@ -244,199 +230,6 @@ def fetch_datagov(
     if "district" not in df.columns:
         df["district"] = DISTRICT
     return normalize_prices(df)
-
-
-class AgmarknetError(RuntimeError):
-    pass
-
-
-def _agmarknet_payload(style: str, fields: dict) -> dict:
-    """The report endpoint is undocumented; these are the request shapes we know of."""
-    if style == "native":
-        return {
-            **{k: fields[k] for k in ("from_date", "to_date")},
-            "data_type": AGMARKNET_PRICE,
-            "group": fields["group"],
-            "commodity": fields["commodity"],
-            "state": [fields["state"]],
-            "district": [AGMARKNET_ALL_DISTRICTS],
-            "market": [AGMARKNET_ALL_MARKETS],
-            "grade": [AGMARKNET_ALL_GRADES],
-            "variety": [AGMARKNET_ALL_VARIETIES],
-            "page": fields["page"],
-            "limit": fields["limit"],
-        }
-    # "bracketed" (used by other open-source clients), "query" and "form" share this encoding.
-    return {
-        **{k: fields[k] for k in ("from_date", "to_date")},
-        "data_type": str(AGMARKNET_PRICE),
-        "group": str(fields["group"]),
-        "commodity": str(fields["commodity"]),
-        "state": f"[{fields['state']}]",
-        "district": f"[{AGMARKNET_ALL_DISTRICTS}]",
-        "market": f"[{AGMARKNET_ALL_MARKETS}]",
-        "grade": f"[{AGMARKNET_ALL_GRADES}]",
-        "variety": f"[{AGMARKNET_ALL_VARIETIES}]",
-        "page": str(fields["page"]),
-        "limit": str(fields["limit"]),
-    }
-
-
-AGMARKNET_STYLES = ("bracketed", "native", "query", "form")
-REPORT_PATH = "/daily-price-arrival/report"
-
-
-def _agmarknet_request(
-    http: requests.Session, style: str, fields: dict, timeout: float
-) -> requests.Response:
-    url = f"{AGMARKNET_BASE}{REPORT_PATH}"
-    payload = _agmarknet_payload(style, fields)
-    if style == "query":
-        return http.get(url, params=payload, timeout=timeout)
-    if style == "form":
-        return http.post(url, data=payload, timeout=timeout)
-    return http.post(url, json=payload, timeout=timeout)
-
-
-def _agmarknet_call(http: requests.Session, style: str, fields: dict, timeout: float) -> dict:
-    """One report request, retrying server errors and rate limits but not client errors."""
-    last = ""
-    for attempt in range(1, AGMARKNET_RETRIES + 1):
-        try:
-            resp = _agmarknet_request(http, style, fields, timeout)
-        except requests.RequestException as exc:
-            last = str(exc)
-        else:
-            if resp.ok:
-                try:
-                    return resp.json()
-                except ValueError:
-                    last = f"non-JSON response: {resp.text[:200]!r}"
-            elif 400 <= resp.status_code < 500 and resp.status_code != 429:
-                raise AgmarknetError(f"HTTP {resp.status_code}: {resp.text[:300]!r}")
-            else:
-                last = f"HTTP {resp.status_code}: {resp.text[:200]!r}"
-        if attempt < AGMARKNET_RETRIES:
-            time.sleep(AGMARKNET_BACKOFF_S * (20 if "429" in last else 1) * 2**attempt)
-    raise AgmarknetError(f"{REPORT_PATH} failed after {AGMARKNET_RETRIES} attempts: {last}")
-
-
-def _pick_agmarknet_style(http: requests.Session, fields: dict, timeout: float) -> str:
-    """Probe one recent week with each known request shape and keep the first that works."""
-    end = dt.date.today()
-    probe = {
-        **fields,
-        "from_date": (end - dt.timedelta(days=7)).isoformat(),
-        "to_date": end.isoformat(),
-        "page": 1,
-        "limit": 50,
-    }
-    errors = []
-    for style in AGMARKNET_STYLES:
-        try:
-            doc = _agmarknet_call(http, style, probe, timeout)
-        except AgmarknetError as exc:
-            errors.append(f"{style}: {exc}")
-            log.warning("Agmarknet request style %r rejected: %s", style, exc)
-            continue
-        log.info(
-            "Agmarknet request style %r accepted (%d groups)",
-            style,
-            len((doc.get("data") or {}).get("records") or []),
-        )
-        return style
-    raise AgmarknetError("no request style accepted; " + " | ".join(errors))
-
-
-def agmarknet_ids(filters: dict) -> tuple[int, int, int]:
-    """Return (state_id, commodity_id, commodity_group_id) for Karnataka arecanut."""
-    state_id = next(
-        (int(s["state_id"]) for s in filters["state_data"] if _key(s["state_name"]) == _key(STATE)),
-        None,
-    )
-    cmdt = next(
-        (c for c in filters["cmdt_data"] if _key(c["cmdt_name"]) == _key(COMMODITY)),
-        None,
-    ) or next((c for c in filters["cmdt_data"] if "arecanut" in _key(c["cmdt_name"])), None)
-    if state_id is None or cmdt is None:
-        raise AgmarknetError("Karnataka or arecanut not found in Agmarknet filter lists")
-    return state_id, int(cmdt["cmdt_id"]), int(cmdt["cmdt_group_id"])
-
-
-def _agmarknet_rows(doc: dict) -> list[dict]:
-    """Report records come grouped; flatten them into the OGD-like row shape."""
-    groups = (doc.get("data") or {}).get("records") or []
-    rows = [r for g in groups for r in (g.get("data") or [])]
-    return [
-        {
-            "state": r.get("state_name"),
-            "district": r.get("district_name"),
-            "market": r.get("market_name"),
-            "commodity": r.get("cmdt_name"),
-            "variety": r.get("variety_name"),
-            "arrival_date": str(r.get("arrival_date", "")).strip(),  # DD-MM-YYYY
-            "min_price": r.get("min_price"),
-            "max_price": r.get("max_price"),
-            # The API spells the modal price "model_price".
-            "modal_price": r.get("model_price", r.get("modal_price")),
-        }
-        for r in rows
-    ]
-
-
-def fetch_agmarknet(
-    start: dt.date,
-    end: dt.date,
-    *,
-    session: requests.Session | None = None,
-    timeout: float = 120.0,
-    page_size: int = 1000,
-) -> pd.DataFrame:
-    """Karnataka arecanut prices from the public Agmarknet 2.0 report API (no key needed).
-
-    This is the endpoint behind agmarknet.gov.in's "Daily Price and Arrival Report" page. Price
-    history starts 2021-01-01 and one request may span at most a year, so longer ranges are
-    fetched in yearly chunks. A chunk that keeps failing is skipped with a warning.
-    """
-    http = session or requests.Session()
-    http.headers.update({"User-Agent": AGMARKNET_USER_AGENT, "Accept": "application/json"})
-    resp = http.get(f"{AGMARKNET_BASE}/daily-price-arrival/filters", timeout=timeout)
-    resp.raise_for_status()
-    state_id, cmdt_id, group_id = agmarknet_ids(resp.json()["data"])
-
-    ids = {"state": state_id, "commodity": cmdt_id, "group": group_id}
-    style = _pick_agmarknet_style(http, ids, timeout)
-
-    start = max(start, AGMARKNET_EARLIEST)
-    rows: list[dict] = []
-    chunk_start = start
-    while chunk_start <= end:
-        chunk_end = min(chunk_start + dt.timedelta(days=364), end)
-        page = 1
-        try:
-            while True:
-                fields = {
-                    **ids,
-                    "from_date": chunk_start.isoformat(),
-                    "to_date": chunk_end.isoformat(),
-                    "page": page,
-                    "limit": page_size,
-                }
-                batch = _agmarknet_rows(_agmarknet_call(http, style, fields, timeout))
-                rows.extend(batch)
-                if len(batch) < page_size:
-                    break
-                page += 1
-                time.sleep(AGMARKNET_BACKOFF_S)
-        except AgmarknetError as exc:
-            log.warning("skipped Agmarknet %s..%s: %s", chunk_start, chunk_end, exc)
-        log.info("Agmarknet %s..%s: %d Karnataka rows so far", chunk_start, chunk_end, len(rows))
-        chunk_start = chunk_end + dt.timedelta(days=1)
-        time.sleep(AGMARKNET_BACKOFF_S)
-
-    if not rows:
-        return pd.DataFrame(columns=PRICE_COLUMNS)
-    return normalize_prices(pd.DataFrame(rows))
 
 
 def normalize_weather(raw: pd.DataFrame) -> pd.DataFrame:
